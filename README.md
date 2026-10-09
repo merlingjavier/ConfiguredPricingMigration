@@ -62,4 +62,37 @@ Una celda solo puede tener una tasa por `idTipoTasa` para la misma clave de esqu
 
 La migracion inicial crea grupos `AUTO-*` con IDs canonicos derivados de sus miembros. `DEFAULT` es solo una etiqueta informativa cuando el grupo contiene todos los miembros vigentes de una dimension; no altera su identidad. La consolidacion conserva la trazabilidad de los IDs legacy.
 
-Compilar con `dotnet build ConfiguredPricingMigration.UI/ConfiguredPricingMigration.UI.csproj`.
+## Compilacion y distribucion
+
+Para compilar la aplicacion durante el desarrollo:
+
+```powershell
+dotnet build .\ConfiguredPricingMigration.UI\ConfiguredPricingMigration.UI.csproj -c Release
+```
+
+Para generar un ejecutable autocontenido para Windows de 64 bits, sin requerir
+que el equipo destino tenga instalado .NET:
+
+```powershell
+dotnet publish .\ConfiguredPricingMigration.UI\ConfiguredPricingMigration.UI.csproj `
+  -c Release `
+  -r win-x64 `
+  --self-contained true `
+  -p:PublishSingleFile=true `
+  -o .\publish
+```
+
+El artefacto se genera como `publish\ConfiguredPricingMigration.UI.exe`.
+
+## Uso del ejecutable
+
+1. Copie la carpeta `publish` completa al equipo donde se ejecutara la migracion.
+2. Cree `publish\.env` a partir de `.env.example` y reemplace los valores de ejemplo por las cadenas de conexion del ambiente correspondiente.
+3. Restrinja los permisos NTFS de `publish\.env` a la cuenta o grupo autorizado para ejecutar la herramienta. No distribuya este archivo mediante control de versiones ni lo incluya en paquetes compartidos.
+4. Ejecute `ConfiguredPricingMigration.UI.exe` desde la carpeta `publish`.
+5. Use `Probar configuracion` antes de iniciar una migracion y valide el Run antes de transferirlo y publicarlo.
+
+El archivo `.env` se busca primero junto al ejecutable y sus valores solo se
+aplican cuando no existe una variable de entorno del mismo nombre. Para un
+despliegue administrado, configure las variables de entorno de Windows para la
+cuenta operativa y omita el archivo `.env`.
