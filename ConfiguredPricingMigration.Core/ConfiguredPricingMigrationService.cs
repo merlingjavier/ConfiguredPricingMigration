@@ -2556,6 +2556,67 @@ ORDER BY t.idTasa;
                 cancellationToken: cancellationToken
             );
         await _migrationDatabase
+            .GetCollection<BsonDocument>(Rows)
+            .Indexes.CreateOneAsync(
+                new CreateIndexModel<BsonDocument>(
+                    Builders<BsonDocument>
+                        .IndexKeys.Ascending("migrationRunId")
+                        .Ascending("productId")
+                        .Ascending("configuredPricingVersionId")
+                        .Ascending("branchId")
+                        .Ascending("applicabilityKey")
+                        .Ascending("rateTypeId")
+                        .Ascending("legacyRateId")
+                ),
+                cancellationToken: cancellationToken
+            );
+        await _migrationDatabase
+            .GetCollection<BsonDocument>(Rows)
+            .Indexes.CreateOneAsync(
+                new CreateIndexModel<BsonDocument>(
+                    Builders<BsonDocument>
+                        .IndexKeys.Ascending("migrationRunId")
+                        .Ascending("productId")
+                        .Ascending("includedInRateSet")
+                        .Ascending("configuredPricingVersionId")
+                        .Ascending("internalRatingLegacyId")
+                        .Ascending("applicabilityKey")
+                        .Ascending("rateTypeId")
+                        .Ascending("legacyRateId")
+                ),
+                cancellationToken: cancellationToken
+            );
+        await _migrationDatabase
+            .GetCollection<BsonDocument>(Rows)
+            .Indexes.CreateOneAsync(
+                new CreateIndexModel<BsonDocument>(
+                    Builders<BsonDocument>
+                        .IndexKeys.Ascending("migrationRunId")
+                        .Ascending("productId")
+                        .Ascending("includedInRateSet")
+                        .Ascending("applicabilityKey")
+                        .Ascending("rateTypeId")
+                        .Ascending("branchId")
+                        .Ascending("legacyRateId")
+                ),
+                cancellationToken: cancellationToken
+            );
+        await _migrationDatabase
+            .GetCollection<BsonDocument>(Rows)
+            .Indexes.CreateOneAsync(
+                new CreateIndexModel<BsonDocument>(
+                    Builders<BsonDocument>
+                        .IndexKeys.Ascending("migrationRunId")
+                        .Ascending("productId")
+                        .Ascending("includedInRateSet")
+                        .Ascending("applicabilityKey")
+                        .Ascending("rateTypeId")
+                        .Ascending("internalRatingLegacyId")
+                        .Ascending("legacyRateId")
+                ),
+                cancellationToken: cancellationToken
+            );
+        await _migrationDatabase
             .GetCollection<BsonDocument>(RateSets)
             .Indexes.CreateOneAsync(
                 new CreateIndexModel<BsonDocument>(
