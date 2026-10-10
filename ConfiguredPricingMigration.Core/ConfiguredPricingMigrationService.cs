@@ -1,6 +1,5 @@
 using System.Security.Cryptography;
 using System.Text;
-using ConfiguredPricingCatalogSync.Core;
 using Microsoft.Data.SqlClient;
 using MongoDB.Bson;
 using MongoDB.Driver;

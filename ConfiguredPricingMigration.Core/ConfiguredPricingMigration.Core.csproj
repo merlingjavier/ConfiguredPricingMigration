@@ -5,7 +5,6 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\ConfiguredPricingCatalogSync\ConfiguredPricingCatalogSync.Core\ConfiguredPricingCatalogSync.Core.csproj" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.3" />
     <PackageReference Include="MongoDB.Driver" Version="3.11.2" />
   </ItemGroup>
