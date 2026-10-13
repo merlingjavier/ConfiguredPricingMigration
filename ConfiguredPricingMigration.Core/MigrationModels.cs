@@ -3,7 +3,9 @@ namespace ConfiguredPricingMigration.Core;
 public sealed class MigrationOptions
 {
     public string SqlConnectionString { get; init; } = string.Empty;
+    [Obsolete("La sincronizacion directa no usa una base de migracion.")]
     public string MigrationMongoConnectionString { get; init; } = string.Empty;
+    [Obsolete("La sincronizacion directa no usa una base de migracion.")]
     public string MigrationMongoDatabase { get; init; } = "ConfiguredPricingMigration";
     public string TargetMongoConnectionString { get; init; } = string.Empty;
     public string TargetMongoDatabase { get; init; } = "ConfiguredPricing";
@@ -17,7 +19,8 @@ public sealed record MigrationProgress(
     long Processed,
     long Loaded,
     long Rejected,
-    string Message
+    string Message,
+    int? Percent = null
 );
 
 public sealed class MigrationStoppedException(string nextRunId)

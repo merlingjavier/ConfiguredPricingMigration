@@ -1,6 +1,6 @@
 # Configured Pricing Migration
 
-Aplicacion WinForms independiente para ejecutar manualmente la carga inicial de `dbo.SI_FinTasa`. El staging, los controles y el resultado preliminar se almacenan en una base MongoDB de migracion separada. Solo la accion explicita de transferencia copia un `Run ID` validado y lo publica en la base operativa.
+Aplicacion WinForms independiente para sincronizar `dbo.SI_FinTasa` con la base operativa. Cada ejecución genera una versión inmutable a partir del estado actual de SQL Server y la activa solo al finalizar correctamente. No usa base MongoDB de staging ni requiere `Run ID`.
 
 Las conexiones y bases de datos se configuran exclusivamente mediante variables
 de entorno o el archivo `.env`; no se muestran ni se editan desde la interfaz.
@@ -13,8 +13,6 @@ El archivo `apps/ConfiguredPricingMigration/.env.example` contiene una plantilla
 
 ```dotenv
 SQL_CONNECTION_STRING="Server=...;Database=...;Trusted_Connection=True;"
-MIGRATION_MONGO_CONNECTION_STRING="mongodb://..."
-MIGRATION_MONGO_DATABASE="ConfiguredPricingMigration"
 TARGET_MONGO_CONNECTION_STRING="mongodb://..."
 TARGET_MONGO_DATABASE="ConfiguredPricing"
 MIGRATION_BATCH_SIZE=10000
@@ -24,11 +22,8 @@ MIGRATION_PRODUCT_IDS=1028,1035,1041
 | Configuracion | Variable de entorno | Uso |
 | --- | --- | --- |
 | SQL Server | `SQL_CONNECTION_STRING` | Cadena de conexion de solo lectura a SQL Server, desde donde se consulta `dbo.SI_FinTasa`, `dbo.SI_FinMonto` y `dbo.SI_FinPlazo`. |
-| MongoDB migracion | `MIGRATION_MONGO_CONNECTION_STRING` | Cadena de conexion a la base no operativa donde se almacenan staging, checkpoints, conjuntos preliminares, validaciones y excepciones. |
-| Base migracion | `MIGRATION_MONGO_DATABASE` | Nombre de la base MongoDB/DocumentDB de staging. El valor predeterminado es `ConfiguredPricingMigration`. |
-| MongoDB operativo | `TARGET_MONGO_CONNECTION_STRING` | Cadena de conexion a la base operativa que utiliza Discount Pricing S. Solo se usa al transferir y publicar un Run validado. |
+| MongoDB operativo | `TARGET_MONGO_CONNECTION_STRING` | Cadena de conexion a la base operativa que utiliza Discount Pricing S. |
 | Base operativa | `TARGET_MONGO_DATABASE` | Nombre de la base MongoDB/DocumentDB operativa. El valor predeterminado es `ConfiguredPricing`. |
-| Run ID | No aplica | Identificador de una ejecución de un solo tipo de esquema. Ordinario conserva checkpoints por producto; Línea Base y Especial conservan un checkpoint global por `idTasa`. |
 | idProductos separados por coma | `MIGRATION_PRODUCT_IDS` | Filtro disponible solo para Ordinario. Línea Base y Especial leen los registros elegibles de `SI_FinTasa` sin filtrar ni exigir `idProducto`. |
 | Tamano de lote | `MIGRATION_BATCH_SIZE` | Filas leidas y confirmadas por iteracion. Acepta valores entre 1,000 y 100,000; el predeterminado es 10,000. |
 
@@ -40,7 +35,9 @@ Para Ordinario, si `idProductos` esta vacio, se resuelven productos vigentes del
 
 Durante la carga, el boton `Ejecutar migración` sincroniza primero los catalogos vigentes del modulo de creditos hacia la base operativa y registra el snapshot en el Run ID. Si falla esa sincronizacion, el ETL no inicia. `Detener migración` en Ordinario conserva los productos terminados y crea un Run para los pendientes. Línea Base y Especial deben publicarse como una unidad global; al detenerlos se cierra el Run sin publicar y se crea un sucesor para reextraer el esquema completo.
 
-## Transferencia y publicacion
+## Sincronizacion y publicacion
+
+La sincronización es idempotente. Las celdas tienen IDs deterministas y cada versión se identifica por el hash del snapshot de SQL Server. Si el origen no cambió, se reutiliza la misma versión; si cambió, se crea una nueva versión que contiene exclusivamente las celdas presentes en SQL. Las versiones previas se conservan como historial.
 
 `Transferir y publicar Run validado` no usa un endpoint HTTP. Copia desde la base de migracion solo los esquemas, versiones, rangos, grupos genericos y celdas del `Run ID` seleccionado hacia la base operativa. Antes de transferir exige una validacion correcta y ausencia de celdas ambiguas. La transferencia se puede reintentar: los documentos destino se reemplazan por su misma clave y no se copian colecciones de staging.
 

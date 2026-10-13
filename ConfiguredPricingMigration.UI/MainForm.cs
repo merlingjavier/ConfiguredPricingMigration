@@ -76,6 +76,13 @@ public sealed class MainForm : Form
         Font = new Font("Consolas", 9),
         BorderStyle = BorderStyle.FixedSingle
     };
+    private readonly ProgressBar _migrationProgress = new()
+    {
+        Dock = DockStyle.Fill,
+        Minimum = 0,
+        Maximum = 100,
+        Style = ProgressBarStyle.Continuous
+    };
     private readonly Button _test = new()
     {
         Text = "Probar conexiones",
@@ -83,7 +90,7 @@ public sealed class MainForm : Form
     };
     private readonly Button _migrate = new()
     {
-        Text = "Ejecutar migración",
+        Text = "Migrar",
         AutoSize = true
     };
     private readonly Button _stop = new()
@@ -176,18 +183,6 @@ public sealed class MainForm : Form
         var fields = CreateFieldsPanel();
         _schemaTypeCards = CreateSchemaTypeCards();
         AddField(fields, "Tipo de esquema", _schemaTypeCards);
-        var runIdField = CreateExpandableFieldPanel(_runId, _generateRunId);
-        AddFieldWithHelp(
-            fields,
-            "Run ID",
-            "Identifica esta ejecución y permite retomarla.",
-            runIdField);
-        var runSelector = CreateExpandableFieldPanel(_runs, _loadRuns);
-        AddFieldWithHelp(
-            fields,
-            "Runs existentes",
-            "Seleccione uno para continuar o revisar su estado.",
-            runSelector);
         AddFieldWithHelp(
             fields,
             "Productos (opcional)",
@@ -201,19 +196,31 @@ public sealed class MainForm : Form
 
         ConfigureActionButtons();
         var actions = CreateActionsPanel();
-        actions.Controls.AddRange([_test, _migrate, _stop, _validate, _publish]);
+        actions.Controls.AddRange([_test, _migrate, _stop]);
         var setup = CreateSectionCard(
             "Preparar migración",
             "Las conexiones se administran mediante variables de entorno o el archivo .env local.",
             fields);
         var actionCard = CreateSectionCard(
             "Acciones",
-            "Pruebe la configuración antes de ejecutar. Valide el Run antes de publicarlo.",
+            "La sincronización construye una versión inmutable y la activa al finalizar.",
             actions);
+        var activityBody = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(14, 4, 14, 14)
+        };
+        activityBody.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        activityBody.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        activityBody.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        activityBody.Controls.Add(_log, 0, 0);
+        activityBody.Controls.Add(_migrationProgress, 0, 1);
         var activity = CreateSectionCard(
             "Actividad de la migración",
             "Mensajes, avance y resultados de las operaciones ejecutadas.",
-            _log,
+            activityBody,
             fillBody: true);
         activity.Dock = DockStyle.Fill;
         activity.MinimumSize = new Size(0, 320);
@@ -249,10 +256,6 @@ public sealed class MainForm : Form
     private void LoadEnvironmentConfiguration()
     {
         _sqlConnection.Text = GetEnvironmentValue("SQL_CONNECTION_STRING");
-        _migrationMongoConnection.Text = GetEnvironmentValue("MIGRATION_MONGO_CONNECTION_STRING");
-        _migrationMongoDatabase.Text = GetEnvironmentValue(
-            "MIGRATION_MONGO_DATABASE",
-            _migrationMongoDatabase.Text);
         _targetMongoConnection.Text = GetEnvironmentValue("TARGET_MONGO_CONNECTION_STRING");
         _targetMongoDatabase.Text = GetEnvironmentValue("TARGET_MONGO_DATABASE", _targetMongoDatabase.Text);
         _productIds.Text = GetEnvironmentValue("MIGRATION_PRODUCT_IDS");
@@ -280,8 +283,6 @@ public sealed class MainForm : Form
     private string CreateConfigurationStatus()
     {
         var isConfigured = !string.IsNullOrWhiteSpace(_sqlConnection.Text)
-            && !string.IsNullOrWhiteSpace(_migrationMongoConnection.Text)
-            && !string.IsNullOrWhiteSpace(_migrationMongoDatabase.Text)
             && !string.IsNullOrWhiteSpace(_targetMongoConnection.Text)
             && !string.IsNullOrWhiteSpace(_targetMongoDatabase.Text);
 
@@ -336,9 +337,11 @@ public sealed class MainForm : Form
     private static void StyleActionButton(Button button, Color background, Color foreground)
     {
         button.AutoSize = false;
-        button.Width = TextRenderer.MeasureText(button.Text, button.Font).Width + 28;
-        button.Height = 36;
         button.Padding = new Padding(10, 0, 10, 0);
+        button.Width = TextRenderer.MeasureText(button.Text, button.Font).Width
+            + button.Padding.Horizontal
+            + 28;
+        button.Height = 36;
         button.TextAlign = ContentAlignment.MiddleCenter;
         button.FlatStyle = FlatStyle.Flat;
         button.FlatAppearance.BorderColor = background;
@@ -706,8 +709,6 @@ public sealed class MainForm : Form
     private MigrationOptions CreateMigrationOptions() => new()
     {
         SqlConnectionString = _sqlConnection.Text.Trim(),
-        MigrationMongoConnectionString = _migrationMongoConnection.Text.Trim(),
-        MigrationMongoDatabase = _migrationMongoDatabase.Text.Trim(),
         TargetMongoConnectionString = _targetMongoConnection.Text.Trim(),
         TargetMongoDatabase = _targetMongoDatabase.Text.Trim(),
         BatchSize = Decimal.ToInt32(_batchSize.Value),
@@ -719,8 +720,30 @@ public sealed class MainForm : Form
 
     private IProgress<MigrationProgress> CreateProgressReporter() =>
         new Progress<MigrationProgress>(progress =>
+        {
+            UpdateMigrationProgress(progress.Percent);
             Log($"[{progress.Stage}] {progress.Message} Procesadas={progress.Processed}; " +
-                $"Cargadas={progress.Loaded}; Rechazadas={progress.Rejected}"));
+                $"Cargadas={progress.Loaded}; Rechazadas={progress.Rejected}");
+        });
+
+    private void UpdateMigrationProgress(int? percent)
+    {
+        if (percent is null)
+        {
+            _migrationProgress.Style = ProgressBarStyle.Marquee;
+            _migrationProgress.MarqueeAnimationSpeed = 30;
+            return;
+        }
+
+        _migrationProgress.Style = ProgressBarStyle.Continuous;
+        _migrationProgress.Value = Math.Clamp(percent.Value, _migrationProgress.Minimum, _migrationProgress.Maximum);
+    }
+
+    private void ResetMigrationProgress()
+    {
+        _migrationProgress.Style = ProgressBarStyle.Continuous;
+        _migrationProgress.Value = _migrationProgress.Minimum;
+    }
 
     private async Task LoadPreviewAsync()
     {
@@ -1202,44 +1225,35 @@ public sealed class MainForm : Form
     {
         if (_migrationCancellation is not null) return;
 
-        if (string.IsNullOrWhiteSpace(_runId.Text))
-        {
-            OperationErrorPresenter.Show(
-                this,
-                Log,
-                new ArgumentException("Ingrese un Run ID para iniciar la migración."),
-                "iniciar migración",
-                _runId.Text.Trim());
-            return;
-        }
         using var cancellation = new CancellationTokenSource();
         _migrationCancellation = cancellation;
+        ResetMigrationProgress();
         SetControlsEnabled(false);
         _stop.Enabled = true;
         try
         {
             var service = new ConfiguredPricingMigrationService(CreateMigrationOptions());
             var result = await service.MigrateAsync(
-                _runId.Text.Trim(),
+                "DIRECT",
                 CreateProgressReporter(),
                 cancellation.Token);
             Log(
                 $"ETL completado: extraidas={result.Extracted}, cargadas={result.Loaded}, " +
                 $"rechazadas={result.Rejected}, conjuntos={result.RateSets}.");
-            await LoadRunsAsync();
         }
         catch (MigrationStoppedException exception)
         {
-            _runId.Text = exception.NextRunId;
+            ResetMigrationProgress();
             Log(CreateMigrationStoppedMessage(exception.NextRunId));
-            await LoadRunsAsync();
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
+            ResetMigrationProgress();
             Log("Migración detenida.");
         }
         catch (Exception exception)
         {
+            ResetMigrationProgress();
             OperationErrorPresenter.Show(this, Log, exception, "ejecutar migración", _runId.Text.Trim());
         }
         finally

@@ -20,14 +20,12 @@ public sealed record CatalogSyncSummary(
 
 public sealed class CatalogSyncService(CatalogSyncOptions options)
 {
-    private const string Runs = "ConfiguredPricingCatalogSyncRuns";
-
     public async Task<CatalogSyncSummary> SyncAsync(
-        string runId,
+        string snapshotId,
         CancellationToken cancellationToken
     )
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(runId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(snapshotId);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.SqlConnectionString);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.MongoConnectionString);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.MongoDatabase);
@@ -35,83 +33,35 @@ public sealed class CatalogSyncService(CatalogSyncOptions options)
         var database = new MongoClient(options.MongoConnectionString).GetDatabase(
             options.MongoDatabase
         );
-        var runs = database.GetCollection<BsonDocument>(Runs);
-        await runs.ReplaceOneAsync(
-            Builders<BsonDocument>.Filter.Eq("_id", runId),
-            new BsonDocument
-            {
-                { "_id", runId },
-                { "status", "RUNNING" },
-                { "mode", "SNAPSHOT_ONLY" },
-                { "startedAt", DateTime.UtcNow },
-            },
-            new ReplaceOptions { IsUpsert = true },
-            cancellationToken
-        );
-
-        try
+        await using var connection = new SqlConnection(options.SqlConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)
+            await connection.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
+        var snapshots = new List<CatalogSnapshot>();
+        foreach (var definition in CatalogDefinition.All)
         {
-            await using var connection = new SqlConnection(options.SqlConnectionString);
-            await connection.OpenAsync(cancellationToken);
-            await using var transaction = (SqlTransaction)
-                await connection.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
-            var snapshots = new List<CatalogSnapshot>();
-            foreach (var definition in CatalogDefinition.All)
-            {
-                snapshots.Add(
-                    await ReadSnapshotAsync(
-                        connection,
-                        transaction,
-                        definition,
-                        runId,
-                        cancellationToken
-                    )
-                );
-            }
-            await transaction.CommitAsync(cancellationToken);
-
-            var results = new Dictionary<string, CatalogSyncResult>(StringComparer.Ordinal);
-            foreach (var snapshot in snapshots)
-            {
-                results[snapshot.Definition.CollectionName] = await ApplySnapshotAsync(
-                    database,
-                    snapshot,
-                    runId,
+            snapshots.Add(
+                await ReadSnapshotAsync(
+                    connection,
+                    transaction,
+                    definition,
+                    snapshotId,
                     cancellationToken
-                );
-            }
+                )
+            );
+        }
+        await transaction.CommitAsync(cancellationToken);
 
-            await runs.UpdateOneAsync(
-                Builders<BsonDocument>.Filter.Eq("_id", runId),
-                Builders<BsonDocument>
-                    .Update.Set("status", "SUCCESS")
-                    .Set("completedAt", DateTime.UtcNow)
-                    .Set(
-                        "catalogs",
-                        new BsonArray(results.Select(result => new BsonDocument
-                        {
-                            { "collection", result.Key },
-                            { "loaded", result.Value.Loaded },
-                            { "deactivated", result.Value.Deactivated },
-                        }))
-                    ),
-                cancellationToken: cancellationToken
+        var results = new Dictionary<string, CatalogSyncResult>(StringComparer.Ordinal);
+        foreach (var snapshot in snapshots)
+            results[snapshot.Definition.CollectionName] = await ApplySnapshotAsync(
+                database,
+                snapshot,
+                snapshotId,
+                cancellationToken
             );
 
-            return new CatalogSyncSummary(runId, results);
-        }
-        catch (Exception exception)
-        {
-            await runs.UpdateOneAsync(
-                Builders<BsonDocument>.Filter.Eq("_id", runId),
-                Builders<BsonDocument>
-                    .Update.Set("status", "FAILED")
-                    .Set("failedAt", DateTime.UtcNow)
-                    .Set("error", exception.Message),
-                cancellationToken: CancellationToken.None
-            );
-            throw;
-        }
+        return new CatalogSyncSummary(snapshotId, results);
     }
 
     private static async Task<CatalogSnapshot> ReadSnapshotAsync(

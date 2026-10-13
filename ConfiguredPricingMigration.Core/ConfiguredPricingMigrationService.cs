@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Diagnostics;
 using Microsoft.Data.SqlClient;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -25,33 +26,14 @@ public sealed class ConfiguredPricingMigrationService
 
     private readonly MigrationOptions _options;
     private readonly IMongoDatabase _migrationDatabase;
+    private readonly IMongoDatabase _targetDatabase;
     private readonly IReadOnlyList<int> _productIds;
 
     public ConfiguredPricingMigrationService(MigrationOptions options)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(options.SqlConnectionString);
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.MigrationMongoConnectionString);
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.MigrationMongoDatabase);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.TargetMongoConnectionString);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.TargetMongoDatabase);
-
-        var usesSameMongoServer = string.Equals(
-            options.MigrationMongoConnectionString,
-            options.TargetMongoConnectionString,
-            StringComparison.OrdinalIgnoreCase
-        );
-        var usesSameMongoDatabase = string.Equals(
-            options.MigrationMongoDatabase,
-            options.TargetMongoDatabase,
-            StringComparison.OrdinalIgnoreCase
-        );
-
-        if (usesSameMongoServer && usesSameMongoDatabase)
-        {
-            throw new ArgumentException(
-                "La base de staging no puede ser la misma que la base operativa."
-            );
-        }
 
         if (options.BatchSize is < 1 or > 100_000)
         {
@@ -81,9 +63,9 @@ public sealed class ConfiguredPricingMigrationService
 
         _options = options;
         _productIds = options.ProductIds.Distinct().Order().ToArray();
-        _migrationDatabase = new MongoClient(options.MigrationMongoConnectionString).GetDatabase(
-            options.MigrationMongoDatabase
-        );
+        var mongoClient = new MongoClient(options.TargetMongoConnectionString);
+        _targetDatabase = mongoClient.GetDatabase(options.TargetMongoDatabase);
+        _migrationDatabase = _targetDatabase;
     }
 
     public async Task TestConnectionsAsync(CancellationToken cancellationToken)
@@ -113,6 +95,9 @@ public sealed class ConfiguredPricingMigrationService
         CancellationToken cancellationToken
     )
     {
+        return await SynchronizeDirectlyAsync(progress, cancellationToken);
+
+#pragma warning disable CS0162 // The legacy staging workflow remains available for source compatibility.
         ArgumentException.ThrowIfNullOrWhiteSpace(runId);
         await EnsureIndexesAsync(cancellationToken);
 
@@ -446,6 +431,546 @@ public sealed class ConfiguredPricingMigrationService
             allVersionIds
         );
     }
+
+    private async Task<MigrationSummary> SynchronizeDirectlyAsync(
+        IProgress<MigrationProgress>? progress,
+        CancellationToken cancellationToken
+    )
+    {
+        var totalTimer = Stopwatch.StartNew();
+        progress?.Report(new MigrationProgress("CATALOG_SYNC", 0, 0, 0, "Sincronizando catalogos."));
+        var catalogTimer = Stopwatch.StartNew();
+        var catalogSync = new CatalogSyncService(
+            new CatalogSyncOptions(
+                _options.SqlConnectionString,
+                _options.TargetMongoConnectionString,
+                _options.TargetMongoDatabase
+            )
+        );
+        var catalogSummary = await catalogSync.SyncAsync(
+            $"catalog-sync:{DateTime.UtcNow:yyyyMMddHHmmss}",
+            cancellationToken
+        );
+        progress?.Report(
+            new MigrationProgress(
+                "CATALOG_SYNC",
+                catalogSummary.Catalogs.Sum(catalog => catalog.Value.Loaded),
+                0,
+                0,
+                $"Catalogos sincronizados en {FormatDuration(catalogTimer.Elapsed)}."
+            )
+        );
+
+        var scopes = _options.TypeSchema == Ordinary
+            ? (await ResolveProductIdsAsync(cancellationToken)).Select(id => (int?)id).ToArray()
+            : new int?[] { null };
+        if (scopes.Length == 0)
+            throw new InvalidOperationException("No se encontraron productos elegibles para sincronizar.");
+
+        var snapshots = new List<DirectSnapshot>();
+        long extracted = 0;
+        long rateSets = 0;
+        for (var scopeIndex = 0; scopeIndex < scopes.Length; scopeIndex++)
+        {
+            var productId = scopes[scopeIndex];
+            var scopeLabel = productId?.ToString() ?? _options.TypeSchema;
+            var extractionTimer = Stopwatch.StartNew();
+            var rows = await ReadAllRowsAsync(productId, cancellationToken);
+            if (rows.Count == 0)
+                continue;
+
+            var snapshot = await CreateDirectSnapshotAsync(rows, cancellationToken);
+            snapshots.Add(snapshot);
+            extracted += rows.Count;
+            rateSets += snapshot.RateSets.Count;
+            progress?.Report(
+                new MigrationProgress(
+                    "PRODUCT_READY",
+                    extracted,
+                    rateSets,
+                    0,
+                    $"{scopeLabel}: filas={rows.Count:N0}; extraccion={FormatDuration(extractionTimer.Elapsed)}; "
+                        + $"grupos establecimientos={snapshot.BranchGroupCount}; "
+                        + $"grupos perfiles={snapshot.InternalRatingGroupCount}; "
+                        + $"inferencia={FormatDuration(snapshot.InferenceDuration)}; "
+                        + $"snapshot={FormatDuration(snapshot.SnapshotDuration)}.",
+                    (scopeIndex + 1) * 60 / scopes.Length
+                )
+            );
+        }
+        if (snapshots.Count == 0)
+            throw new InvalidOperationException("La consulta SQL no devolvio tarifas elegibles.");
+
+        // The pointer is written last: incomplete candidates cannot become active.
+        var target = TargetDatabase();
+        for (var snapshotIndex = 0; snapshotIndex < snapshots.Count; snapshotIndex++)
+        {
+            var snapshot = snapshots[snapshotIndex];
+            var writeTimer = Stopwatch.StartNew();
+            var writeSummary = await WriteDirectSnapshotAsync(target, snapshot, cancellationToken);
+            progress?.Report(
+                new MigrationProgress(
+                    "WRITE",
+                    extracted,
+                    rateSets,
+                    0,
+                    $"{snapshot.SchemaId}: rangos={FormatDuration(writeSummary.RangesDuration)}; "
+                        + $"documentos={FormatDuration(writeSummary.DocumentsDuration)}; "
+                        + $"rate sets={FormatDuration(writeSummary.RateSetsDuration)}; "
+                        + $"MongoDB total={FormatDuration(writeTimer.Elapsed)}.",
+                    60 + (snapshotIndex + 1) * 30 / snapshots.Count
+                )
+            );
+        }
+        var activationTimer = Stopwatch.StartNew();
+        foreach (var snapshot in snapshots)
+            await ActivateDirectSnapshotAsync(target, snapshot, cancellationToken);
+        progress?.Report(
+            new MigrationProgress(
+                "ACTIVATE",
+                extracted,
+                rateSets,
+                0,
+                $"Versiones activadas en {FormatDuration(activationTimer.Elapsed)}; "
+                    + $"total={FormatDuration(totalTimer.Elapsed)}.",
+                100
+            )
+        );
+
+        return new MigrationSummary(
+            "DIRECT",
+            extracted,
+            extracted,
+            0,
+            rateSets,
+            snapshots.Select(snapshot => snapshot.VersionId).ToArray()
+        );
+    }
+
+    private async Task<List<BsonDocument>> ReadAllRowsAsync(
+        int? productId,
+        CancellationToken cancellationToken
+    )
+    {
+        var rows = new List<BsonDocument>();
+        long lastRateId = 0;
+        while (true)
+        {
+            var batch = await ReadBatchAsync(
+                "direct",
+                productId,
+                lastRateId,
+                _options.BatchSize,
+                _options.TypeSchema,
+                cancellationToken
+            );
+            if (batch.Count == 0)
+                return rows;
+            rows.AddRange(batch);
+            lastRateId = batch[^1]["legacyRateId"].ToInt64();
+        }
+    }
+
+    private async Task<DirectSnapshot> CreateDirectSnapshotAsync(
+        IReadOnlyList<BsonDocument> rows,
+        CancellationToken cancellationToken
+    )
+    {
+        var schemaId = rows[0]["configuredPricingId"].AsString;
+        var inferenceTimer = Stopwatch.StartNew();
+        await InferDirectDimensionGroupsAsync(rows, cancellationToken);
+        var snapshotTimer = Stopwatch.StartNew();
+
+        var rateSets = new List<BsonDocument>();
+        foreach (var sameCell in rows.GroupBy(row => row["applicabilityKey"].AsString, StringComparer.Ordinal))
+        {
+            var rates = new BsonArray();
+            foreach (var sameRateType in sameCell.GroupBy(row => row["rateTypeId"].ToInt32()))
+            {
+                var first = sameRateType.First();
+                if (sameRateType.Skip(1).Any(row => !RatesEquivalent(first["rate"].AsBsonDocument, row["rate"].AsBsonDocument)))
+                    throw new InvalidOperationException(
+                        $"La celda {sameCell.Key} tiene tasas incompatibles para el tipo {sameRateType.Key}."
+                    );
+                rates.Add(new BsonDocument
+                {
+                    { "rateTypeId", sameRateType.Key },
+                    { "compensatory", first["rate"].AsBsonDocument["compensatory"] },
+                    { "compensatoryMax", first["rate"].AsBsonDocument["compensatoryMax"] },
+                    { "moratory", first["rate"].AsBsonDocument["moratory"] },
+                    { "legacyRateIds", new BsonArray(sameRateType.Select(row => row["legacyRateId"]).OrderBy(id => id.ToInt64())) },
+                });
+            }
+            var representative = sameCell.First();
+            rateSets.Add(new BsonDocument
+            {
+                { "configuredPricingId", schemaId },
+                { "typeSchema", _options.TypeSchema },
+                { "pricingMode", representative["pricingMode"] },
+                { "applicabilityKey", sameCell.Key },
+                { "coordinates", DirectCoordinates(representative) },
+                { "rates", rates },
+                { "active", true },
+            });
+        }
+
+        var snapshotHash = Hash(string.Join(
+            "\n",
+            rateSets.OrderBy(rateSet => rateSet["applicabilityKey"].AsString, StringComparer.Ordinal)
+                .Select(rateSet => rateSet.ToJson())
+        ));
+        var versionId = $"configured-pricing-version:{Hash($"{schemaId}|{snapshotHash}")}";
+        foreach (var rateSet in rateSets)
+        {
+            rateSet["_id"] = $"configured-pricing-rate-set:{Hash($"{versionId}|{rateSet["applicabilityKey"]}")}";
+            rateSet["configuredPricingVersionId"] = versionId;
+            rateSet["contentHash"] = Hash(rateSet.ToJson());
+        }
+        var branchGroupCount = CountDirectGroups(rows, "branch");
+        var internalRatingGroupCount = CountDirectGroups(rows, "internalRating");
+        return new DirectSnapshot(
+            schemaId,
+            versionId,
+            snapshotHash,
+            rows,
+            rateSets,
+            branchGroupCount,
+            internalRatingGroupCount,
+            inferenceTimer.Elapsed,
+            snapshotTimer.Elapsed
+        );
+    }
+
+    private static int CountDirectGroups(IReadOnlyList<BsonDocument> rows, string dimension) => rows
+        .Select(row => row["dimensionGroupIds"].AsBsonDocument.GetValue(dimension, BsonNull.Value))
+        .Where(groupId => groupId.IsString)
+        .Select(groupId => groupId.AsString)
+        .Distinct(StringComparer.Ordinal)
+        .Count();
+
+    private async Task InferDirectDimensionGroupsAsync(
+        IReadOnlyList<BsonDocument> rows,
+        CancellationToken cancellationToken
+    )
+    {
+        var dimensions = _options.TypeSchema switch
+        {
+            Ordinary => new[] { "branch", "internalRating" },
+            Special => new[] { "branch" },
+            _ => Array.Empty<string>(),
+        };
+        if (dimensions.Length == 0)
+            return;
+
+        foreach (var dimension in dimensions)
+            AssignSingletonGroups(rows, dimension);
+
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var dimension in dimensions)
+                changed |= InferDirectDimensionPartition(rows, dimension);
+        }
+
+        foreach (var dimension in dimensions)
+            await PersistDirectDimensionGroupsAsync(rows, dimension, cancellationToken);
+    }
+
+    private static void AssignSingletonGroups(IReadOnlyList<BsonDocument> rows, string dimension)
+    {
+        foreach (var row in rows)
+        {
+            var memberId = DirectMemberId(row, dimension);
+            var groupId = DimensionGroupId(dimension, [memberId]);
+            SetDirectDimensionGroup(row, dimension, groupId);
+        }
+    }
+
+    private static bool InferDirectDimensionPartition(
+        IReadOnlyList<BsonDocument> rows,
+        string dimension
+    )
+    {
+        var members = rows.GroupBy(row => DirectMemberId(row, dimension))
+            .Select(member => new DimensionMember(
+                string.Empty,
+                member.Key,
+                GlobalRateSignature(member, dimension)
+            ))
+            .ToList();
+        var assignments = new Dictionary<int, string>();
+        foreach (var equivalentMembers in members.GroupBy(
+            member => member.Signature ?? $"invalid:{member.MemberId}",
+            StringComparer.Ordinal))
+        {
+            var memberIds = equivalentMembers.Select(member => member.MemberId).Order().ToArray();
+            var groupId = DimensionGroupId(dimension, memberIds);
+            foreach (var memberId in memberIds)
+                assignments[memberId] = groupId;
+        }
+
+        var changed = false;
+        foreach (var row in rows)
+        {
+            var groupId = assignments[DirectMemberId(row, dimension)];
+            var groups = row["dimensionGroupIds"].AsBsonDocument;
+            if (groups.GetValue(dimension, string.Empty).AsString == groupId)
+                continue;
+            SetDirectDimensionGroup(row, dimension, groupId);
+            changed = true;
+        }
+        return changed;
+    }
+
+    private async Task PersistDirectDimensionGroupsAsync(
+        IReadOnlyList<BsonDocument> rows,
+        string dimension,
+        CancellationToken cancellationToken
+    )
+    {
+        var groups = rows.GroupBy(row => row["dimensionGroupIds"].AsBsonDocument[dimension].AsString)
+            .Select(group => new
+            {
+                Id = group.Key,
+                MemberIds = group.Select(row => DirectMemberId(row, dimension)).Distinct().Order().ToArray(),
+            })
+            .ToList();
+        var writes = groups.Select(group => (WriteModel<BsonDocument>)new UpdateOneModel<BsonDocument>(
+            Builders<BsonDocument>.Filter.Eq("_id", group.Id),
+            Builders<BsonDocument>.Update
+                .SetOnInsert("_id", group.Id)
+                .SetOnInsert("dimensionKey", dimension)
+                .SetOnInsert("code", $"AUTO-{Hash(string.Join(",", group.MemberIds))[..12]}")
+                .SetOnInsert("displayLabel", string.Join(",", group.MemberIds))
+                .SetOnInsert("memberIds", new BsonArray(group.MemberIds))
+                .SetOnInsert("active", true)
+        ) { IsUpsert = true }).ToList();
+        await BulkWriteInBatchesAsync(
+            TargetDatabase().GetCollection<BsonDocument>(DimensionGroups),
+            writes,
+            cancellationToken
+        );
+    }
+
+    private static BsonDocument DirectCoordinates(BsonDocument row) => row["typeSchema"].AsString switch
+    {
+        Ordinary => new BsonDocument
+        {
+            { "amountRangeId", row["amountRangeId"] }, { "termRangeId", row["termRangeId"] },
+            { "dimensionGroupIds", row["dimensionGroupIds"] }, { "insurance", row["insurance"] },
+            { "currencyId", row["currencyId"] }, { "personTypeId", row["personTypeId"] },
+        },
+        Baseline => new BsonDocument { { "rateTypeId", row["rateTypeId"] } },
+        _ => new BsonDocument { { "amountRangeId", row["amountRangeId"] }, { "dimensionGroupIds", row["dimensionGroupIds"] } },
+    };
+
+    private async Task<DirectWriteSummary> WriteDirectSnapshotAsync(
+        IMongoDatabase target,
+        DirectSnapshot snapshot,
+        CancellationToken cancellationToken
+    )
+    {
+        var existingVersion = await target.GetCollection<BsonDocument>(Versions)
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", snapshot.VersionId))
+            .FirstOrDefaultAsync(cancellationToken);
+        if (existingVersion?.GetValue("status", string.Empty).AsString == "PUBLISHED")
+            return DirectWriteSummary.Empty;
+
+        var rangesTimer = Stopwatch.StartNew();
+        await WriteDirectRangesAsync(target, snapshot.Rows, cancellationToken);
+        var rangesDuration = rangesTimer.Elapsed;
+        var documentsTimer = Stopwatch.StartNew();
+        var schema = new BsonDocument
+        {
+            { "_id", snapshot.SchemaId }, { "typeSchema", _options.TypeSchema }, { "active", false },
+            { "global", _options.TypeSchema is Baseline or Special },
+            { "pricingModes", new BsonArray(snapshot.RateSets.Select(set => set["pricingMode"]).Distinct()) },
+        };
+        if (_options.TypeSchema == Ordinary)
+            schema["productId"] = snapshot.Rows[0]["productId"];
+        await target.GetCollection<BsonDocument>(Schemas).ReplaceOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", snapshot.SchemaId), schema,
+            new ReplaceOptions { IsUpsert = true }, cancellationToken);
+        await target.GetCollection<BsonDocument>(Versions).ReplaceOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", snapshot.VersionId),
+            new BsonDocument
+            {
+                { "_id", snapshot.VersionId }, { "configuredPricingId", snapshot.SchemaId },
+                { "typeSchema", _options.TypeSchema }, { "snapshotHash", snapshot.SnapshotHash },
+                { "status", "DRAFT" }, { "active", false }, { "createdAt", DateTime.UtcNow },
+            }, new ReplaceOptions { IsUpsert = true }, cancellationToken);
+        var documentsDuration = documentsTimer.Elapsed;
+        var rateSetsTimer = Stopwatch.StartNew();
+        var writes = snapshot.RateSets.Select(rateSet => (WriteModel<BsonDocument>)new ReplaceOneModel<BsonDocument>(
+            Builders<BsonDocument>.Filter.Eq("_id", rateSet["_id"]), rateSet) { IsUpsert = true }).ToList();
+        if (writes.Count > 0)
+            await target.GetCollection<BsonDocument>(RateSets).BulkWriteAsync(
+                writes, new BulkWriteOptions { IsOrdered = false }, cancellationToken);
+
+        return new DirectWriteSummary(
+            rangesDuration,
+            documentsDuration,
+            rateSetsTimer.Elapsed
+        );
+    }
+
+    private static async Task WriteDirectRangesAsync(
+        IMongoDatabase target,
+        IReadOnlyList<BsonDocument> rows,
+        CancellationToken cancellationToken
+    )
+    {
+        await WriteDirectRangeBatchAsync(
+            target,
+            AmountRanges,
+            "amountRangeId",
+            "amount",
+            "legacyAmountIds",
+            "legacyAmountId",
+            rows,
+            cancellationToken
+        );
+        await WriteDirectRangeBatchAsync(
+            target,
+            TermRanges,
+            "termRangeId",
+            "term",
+            "legacyTermIds",
+            "legacyTermId",
+            rows,
+            cancellationToken
+        );
+    }
+
+    private static async Task WriteDirectRangeBatchAsync(
+        IMongoDatabase target,
+        string collection,
+        string rangeIdField,
+        string rangeField,
+        string legacyIdsField,
+        string legacyIdField,
+        IReadOnlyList<BsonDocument> rows,
+        CancellationToken cancellationToken
+    )
+    {
+        var writes = rows
+            .Where(row => !row[rangeIdField].IsBsonNull)
+            .GroupBy(row => row[rangeIdField].AsString, StringComparer.Ordinal)
+            .Select(group =>
+            {
+                var range = group.First()[rangeField].AsBsonDocument;
+                var legacyIds = new BsonArray(
+                    group.Select(row => row[rangeField].AsBsonDocument[legacyIdField]).Distinct()
+                );
+                var update = new BsonDocument
+                {
+                    {
+                        "$setOnInsert",
+                        new BsonDocument
+                        {
+                            { "_id", group.Key },
+                            { "min", range["min"] },
+                            { "max", range["max"] },
+                            { "displayLabel", range["label"] },
+                        }
+                    },
+                    {
+                        "$addToSet",
+                        new BsonDocument(legacyIdsField, new BsonDocument("$each", legacyIds))
+                    },
+                };
+                return (WriteModel<BsonDocument>)new UpdateOneModel<BsonDocument>(
+                    Builders<BsonDocument>.Filter.Eq("_id", group.Key),
+                    new BsonDocumentUpdateDefinition<BsonDocument>(update)
+                ) { IsUpsert = true };
+            })
+            .ToList();
+        await BulkWriteInBatchesAsync(
+            target.GetCollection<BsonDocument>(collection),
+            writes,
+            cancellationToken
+        );
+    }
+
+    private static async Task BulkWriteInBatchesAsync(
+        IMongoCollection<BsonDocument> collection,
+        IReadOnlyList<WriteModel<BsonDocument>> writes,
+        CancellationToken cancellationToken
+    )
+    {
+        const int writeBatchSize = 1_000;
+        for (var offset = 0; offset < writes.Count; offset += writeBatchSize)
+        {
+            var count = Math.Min(writeBatchSize, writes.Count - offset);
+            await collection.BulkWriteAsync(
+                writes.Skip(offset).Take(count),
+                new BulkWriteOptions { IsOrdered = false },
+                cancellationToken
+            );
+        }
+    }
+
+    private static int DirectMemberId(BsonDocument row, string dimension) => dimension == "branch"
+        ? row["branchId"].ToInt32()
+        : row["internalRatingLegacyId"].ToInt32();
+
+    private static void SetDirectDimensionGroup(BsonDocument row, string dimension, string groupId)
+    {
+        row["dimensionGroupIds"].AsBsonDocument[dimension] = groupId;
+        row["applicabilityKey"] = ApplicabilityKey(row, dimension, groupId);
+    }
+
+    private static async Task ActivateDirectSnapshotAsync(
+        IMongoDatabase target,
+        DirectSnapshot snapshot,
+        CancellationToken cancellationToken
+    )
+    {
+        var schema = await target.GetCollection<BsonDocument>(Schemas)
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", snapshot.SchemaId))
+            .FirstOrDefaultAsync(cancellationToken);
+        if (schema?.GetValue("activeVersionId", string.Empty).AsString == snapshot.VersionId)
+            return;
+
+        await target.GetCollection<BsonDocument>(Versions).UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", snapshot.VersionId),
+            Builders<BsonDocument>.Update.Set("status", "PUBLISHED").Set("active", true).Set("publishedAt", DateTime.UtcNow),
+            cancellationToken: cancellationToken);
+        await target.GetCollection<BsonDocument>(Schemas).UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", snapshot.SchemaId),
+            Builders<BsonDocument>.Update.Set("active", true).Set("activeVersionId", snapshot.VersionId).Set("updatedAt", DateTime.UtcNow),
+            cancellationToken: cancellationToken);
+    }
+
+    private sealed record DirectSnapshot(
+        string SchemaId,
+        string VersionId,
+        string SnapshotHash,
+        IReadOnlyList<BsonDocument> Rows,
+        IReadOnlyList<BsonDocument> RateSets,
+        int BranchGroupCount,
+        int InternalRatingGroupCount,
+        TimeSpan InferenceDuration,
+        TimeSpan SnapshotDuration
+    );
+
+    private sealed record DirectWriteSummary(
+        TimeSpan RangesDuration,
+        TimeSpan DocumentsDuration,
+        TimeSpan RateSetsDuration
+    )
+    {
+        public static DirectWriteSummary Empty { get; } = new(
+            TimeSpan.Zero,
+            TimeSpan.Zero,
+            TimeSpan.Zero
+        );
+    }
+
+    private static string FormatDuration(TimeSpan duration) => duration.TotalMinutes >= 1
+        ? $"{duration.TotalMinutes:N1} min"
+        : $"{duration.TotalSeconds:N1} s";
 
     private async Task<MigrationSummary> MigrateGlobalAsync(
         string runId,
@@ -1373,9 +1898,7 @@ public sealed class ConfiguredPricingMigrationService
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(_options.TargetMongoConnectionString);
         ArgumentException.ThrowIfNullOrWhiteSpace(_options.TargetMongoDatabase);
-        return new MongoClient(_options.TargetMongoConnectionString).GetDatabase(
-            _options.TargetMongoDatabase
-        );
+        return _targetDatabase;
     }
 
     private async Task EnsureTargetSchemasAsync(
