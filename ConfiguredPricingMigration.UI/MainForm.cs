@@ -99,6 +99,11 @@ public sealed class MainForm : Form
         AutoSize = true,
         Enabled = false
     };
+    private readonly Button _clearLog = new()
+    {
+        Text = "Limpiar consola",
+        AutoSize = true
+    };
     private readonly Button _validate = new()
     {
         Text = "Validar carga",
@@ -209,14 +214,24 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 2,
+            RowCount = 3,
             Padding = new Padding(14, 4, 14, 14)
         };
         activityBody.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        activityBody.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         activityBody.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         activityBody.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
-        activityBody.Controls.Add(_log, 0, 0);
-        activityBody.Controls.Add(_migrationProgress, 0, 1);
+        var activityActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            FlowDirection = FlowDirection.RightToLeft,
+            Margin = new Padding(0, 0, 0, 4)
+        };
+        activityActions.Controls.Add(_clearLog);
+        activityBody.Controls.Add(activityActions, 0, 0);
+        activityBody.Controls.Add(_log, 0, 1);
+        activityBody.Controls.Add(_migrationProgress, 0, 2);
         var activity = CreateSectionCard(
             "Actividad de la migración",
             "Mensajes, avance y resultados de las operaciones ejecutadas.",
@@ -330,6 +345,7 @@ public sealed class MainForm : Form
         StyleActionButton(_migrate, PrimaryButtonColor, Color.White);
         StyleActionButton(_stop, WarningButtonColor, Color.White);
         StyleActionButton(_test, SecondaryButtonColor, Color.FromArgb(25, 62, 91));
+        StyleActionButton(_clearLog, SecondaryButtonColor, Color.FromArgb(25, 62, 91));
         StyleActionButton(_validate, SecondaryButtonColor, Color.FromArgb(25, 62, 91));
         StyleActionButton(_publish, SecondaryButtonColor, Color.FromArgb(25, 62, 91));
     }
@@ -410,6 +426,7 @@ public sealed class MainForm : Form
         _test.Click += async (_, _) => await TestConnectionsAsync();
         _migrate.Click += async (_, _) => await MigrateOrPauseAsync();
         _stop.Click += (_, _) => _migrationCancellation?.Cancel();
+        _clearLog.Click += (_, _) => _log.Clear();
         _generateRunId.Click += (_, _) => _runId.Text = NewRunId();
         _validate.Click += async (_, _) => await ValidateMigrationAsync();
         _publish.Click += async (_, _) => await TransferAndPublishAsync();
@@ -1240,6 +1257,17 @@ public sealed class MainForm : Form
             Log(
                 $"ETL completado: extraidas={result.Extracted}, cargadas={result.Loaded}, " +
                 $"rechazadas={result.Rejected}, conjuntos={result.RateSets}.");
+            if (result.ProductIssues.Count > 0)
+            {
+                Log(
+                    "Productos con conflictos de tasas resueltos: "
+                        + string.Join(", ", result.ProductIssues.Select(issue => issue.ProductId))
+                        + ". Se conservo el mayor idTasa en cada conflicto."
+                );
+                var issueLogPath = WriteProductIssueLog(result);
+                if (issueLogPath is not null)
+                    Log($"Detalle de conflictos resueltos guardado en: {issueLogPath}");
+            }
         }
         catch (MigrationStoppedException exception)
         {
@@ -1272,6 +1300,90 @@ public sealed class MainForm : Form
             : "Migración global detenida. El Run parcial quedó CANCELLED; el nuevo Run reiniciará " +
                 $"todos los productos para completar el esquema global: {nextRunId}.";
     }
+
+    private string? WriteProductIssueLog(MigrationSummary result)
+    {
+        try
+        {
+            var directory = GetIssueLogDirectory();
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(
+                directory,
+                $"migration-product-issues-{DateTime.Now:yyyyMMdd-HHmmss-fff}.log"
+            );
+            using var writer = new StreamWriter(path, append: false);
+            writer.WriteLine($"Fecha: {DateTime.Now:O}");
+            writer.WriteLine($"Esquema: {SelectedTypeSchema()}");
+            writer.WriteLine("Criterio: se conserva el mayor idTasa por celda y tipo de tasa.");
+            writer.WriteLine(
+                "Productos con conflictos resueltos: "
+                    + string.Join(", ", result.ProductIssues.Select(issue => issue.ProductId))
+            );
+
+            foreach (var issue in result.ProductIssues)
+            {
+                writer.WriteLine();
+                writer.WriteLine($"Producto: {issue.ProductId}");
+                writer.WriteLine($"Filas omitidas por menor idTasa: {issue.DiscardedRateRows}");
+                foreach (var conflict in issue.Conflicts)
+                {
+                    writer.WriteLine($"Celda: {conflict.ApplicabilityKey}");
+                    writer.WriteLine($"Tipo de tasa: {conflict.RateTypeId}");
+                    writer.WriteLine($"idTasa seleccionada: {conflict.SelectedLegacyRateId}");
+                    foreach (var rate in conflict.Rates)
+                    {
+                        var disposition = rate.LegacyRateId == conflict.SelectedLegacyRateId
+                            ? "seleccionada"
+                            : "omitida";
+                        writer.WriteLine(
+                            $"  idTasa={rate.LegacyRateId} ({disposition}); "
+                                + $"compensatoria={FormatRateNumber(rate.Compensatory)}; "
+                                + $"compensatoriaMax={FormatRateNumber(rate.CompensatoryMax)}; "
+                                + $"moratoria={FormatRateNumber(rate.Moratory)}"
+                        );
+                    }
+                }
+            }
+
+            return path;
+        }
+        catch (Exception exception)
+        {
+            Log($"No se pudo guardar el detalle de conflictos resueltos: {exception.Message}");
+            return null;
+        }
+    }
+
+    private static string FormatRateNumber(decimal? value) => value?.ToString(
+        "G29",
+        System.Globalization.CultureInfo.InvariantCulture
+    ) ?? "null";
+
+    private static string GetIssueLogDirectory()
+    {
+#if DEBUG
+        var projectRoot = FindProjectRoot();
+        if (projectRoot is not null)
+            return Path.Combine(projectRoot, "logs");
+#endif
+        return Path.Combine(AppContext.BaseDirectory, "logs");
+    }
+
+#if DEBUG
+    private static string? FindProjectRoot()
+    {
+        for (
+            var directory = new DirectoryInfo(AppContext.BaseDirectory);
+            directory is not null;
+            directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "ConfiguredPricingMigration.sln")))
+                return directory.FullName;
+        }
+
+        return null;
+    }
+#endif
 
     private async Task TestConnectionsAsync()
     {

@@ -36,6 +36,30 @@ public sealed record MigrationSummary(
     long Rejected,
     long RateSets,
     IReadOnlyList<string> VersionIds
+)
+{
+    public IReadOnlyList<MigrationProductIssue> ProductIssues { get; init; } =
+        Array.Empty<MigrationProductIssue>();
+}
+
+public sealed record MigrationProductIssue(
+    int ProductId,
+    long DiscardedRateRows,
+    IReadOnlyList<MigrationRateConflict> Conflicts
+);
+
+public sealed record MigrationRateConflict(
+    string ApplicabilityKey,
+    int RateTypeId,
+    long SelectedLegacyRateId,
+    IReadOnlyList<MigrationRateValue> Rates
+);
+
+public sealed record MigrationRateValue(
+    long LegacyRateId,
+    decimal? Compensatory,
+    decimal? CompensatoryMax,
+    decimal? Moratory
 );
 
 public sealed record ValidationSummary(

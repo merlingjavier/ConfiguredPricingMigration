@@ -467,9 +467,15 @@ public sealed class ConfiguredPricingMigrationService
         if (scopes.Length == 0)
             throw new InvalidOperationException("No se encontraron productos elegibles para sincronizar.");
 
-        var snapshots = new List<DirectSnapshot>();
+        var globalSnapshots = _options.TypeSchema == Ordinary
+            ? null
+            : new List<DirectSnapshot>();
+        var productIssues = new List<MigrationProductIssue>();
+        var versionIds = new List<string>();
         long extracted = 0;
+        long rejected = 0;
         long rateSets = 0;
+        var target = TargetDatabase();
         for (var scopeIndex = 0; scopeIndex < scopes.Length; scopeIndex++)
         {
             var productId = scopes[scopeIndex];
@@ -480,7 +486,27 @@ public sealed class ConfiguredPricingMigrationService
                 continue;
 
             var snapshot = await CreateDirectSnapshotAsync(rows, cancellationToken);
-            snapshots.Add(snapshot);
+            if (_options.TypeSchema == Ordinary && productId is not null && snapshot.Conflicts.Count > 0)
+            {
+                var discardedRateRows = snapshot.Conflicts.Sum(conflict => conflict.Rates.Count - 1);
+                var issue = new MigrationProductIssue(
+                    productId.Value,
+                    discardedRateRows,
+                    snapshot.Conflicts
+                );
+                productIssues.Add(issue);
+                progress?.Report(
+                    new MigrationProgress(
+                        "PRODUCT_CONFLICT_RESOLVED",
+                        extracted,
+                        rateSets,
+                        rejected,
+                        FormatResolvedProductIssue(issue),
+                        (scopeIndex + 1) * 60 / scopes.Length
+                    )
+                );
+            }
+
             extracted += rows.Count;
             rateSets += snapshot.RateSets.Count;
             progress?.Report(
@@ -488,7 +514,7 @@ public sealed class ConfiguredPricingMigrationService
                     "PRODUCT_READY",
                     extracted,
                     rateSets,
-                    0,
+                    rejected,
                     $"{scopeLabel}: filas={rows.Count:N0}; extraccion={FormatDuration(extractionTimer.Elapsed)}; "
                         + $"grupos establecimientos={snapshot.BranchGroupCount}; "
                         + $"grupos perfiles={snapshot.InternalRatingGroupCount}; "
@@ -497,15 +523,13 @@ public sealed class ConfiguredPricingMigrationService
                     (scopeIndex + 1) * 60 / scopes.Length
                 )
             );
-        }
-        if (snapshots.Count == 0)
-            throw new InvalidOperationException("La consulta SQL no devolvio tarifas elegibles.");
 
-        // The pointer is written last: incomplete candidates cannot become active.
-        var target = TargetDatabase();
-        for (var snapshotIndex = 0; snapshotIndex < snapshots.Count; snapshotIndex++)
-        {
-            var snapshot = snapshots[snapshotIndex];
+            if (_options.TypeSchema != Ordinary)
+            {
+                globalSnapshots!.Add(snapshot);
+                continue;
+            }
+
             var writeTimer = Stopwatch.StartNew();
             var writeSummary = await WriteDirectSnapshotAsync(target, snapshot, cancellationToken);
             progress?.Report(
@@ -513,38 +537,111 @@ public sealed class ConfiguredPricingMigrationService
                     "WRITE",
                     extracted,
                     rateSets,
-                    0,
+                    rejected,
                     $"{snapshot.SchemaId}: rangos={FormatDuration(writeSummary.RangesDuration)}; "
                         + $"documentos={FormatDuration(writeSummary.DocumentsDuration)}; "
                         + $"rate sets={FormatDuration(writeSummary.RateSetsDuration)}; "
                         + $"MongoDB total={FormatDuration(writeTimer.Elapsed)}.",
-                    60 + (snapshotIndex + 1) * 30 / snapshots.Count
+                    60 + (scopeIndex + 1) * 30 / scopes.Length
+                )
+            );
+
+            await ActivateDirectSnapshotAsync(target, snapshot, cancellationToken);
+            versionIds.Add(snapshot.VersionId);
+            progress?.Report(
+                new MigrationProgress(
+                    "PRODUCT_PUBLISHED",
+                    extracted,
+                    rateSets,
+                    rejected,
+                    $"Producto {productId}: version {snapshot.VersionId} publicada y activada.",
+                    60 + (scopeIndex + 1) * 30 / scopes.Length
                 )
             );
         }
-        var activationTimer = Stopwatch.StartNew();
-        foreach (var snapshot in snapshots)
-            await ActivateDirectSnapshotAsync(target, snapshot, cancellationToken);
-        progress?.Report(
-            new MigrationProgress(
-                "ACTIVATE",
-                extracted,
-                rateSets,
-                0,
-                $"Versiones activadas en {FormatDuration(activationTimer.Elapsed)}; "
-                    + $"total={FormatDuration(totalTimer.Elapsed)}.",
-                100
-            )
-        );
+        if (versionIds.Count == 0 && globalSnapshots?.Count == 0)
+            throw new InvalidOperationException("La consulta SQL no devolvio tarifas elegibles.");
+
+        if (globalSnapshots is not null)
+        {
+            // A global schema is activated only after every candidate is safely persisted.
+            for (var snapshotIndex = 0; snapshotIndex < globalSnapshots.Count; snapshotIndex++)
+            {
+                var snapshot = globalSnapshots[snapshotIndex];
+                var writeTimer = Stopwatch.StartNew();
+                var writeSummary = await WriteDirectSnapshotAsync(target, snapshot, cancellationToken);
+                progress?.Report(
+                    new MigrationProgress(
+                        "WRITE",
+                        extracted,
+                        rateSets,
+                        rejected,
+                        $"{snapshot.SchemaId}: rangos={FormatDuration(writeSummary.RangesDuration)}; "
+                            + $"documentos={FormatDuration(writeSummary.DocumentsDuration)}; "
+                            + $"rate sets={FormatDuration(writeSummary.RateSetsDuration)}; "
+                            + $"MongoDB total={FormatDuration(writeTimer.Elapsed)}.",
+                        60 + (snapshotIndex + 1) * 30 / globalSnapshots.Count
+                    )
+                );
+            }
+
+            var activationTimer = Stopwatch.StartNew();
+            foreach (var snapshot in globalSnapshots)
+            {
+                await ActivateDirectSnapshotAsync(target, snapshot, cancellationToken);
+                versionIds.Add(snapshot.VersionId);
+            }
+            progress?.Report(
+                new MigrationProgress(
+                    "ACTIVATE",
+                    extracted,
+                    rateSets,
+                    rejected,
+                    $"Versiones activadas en {FormatDuration(activationTimer.Elapsed)}; "
+                        + $"total={FormatDuration(totalTimer.Elapsed)}.",
+                    100
+                )
+            );
+        }
+        else
+        {
+            progress?.Report(
+                new MigrationProgress(
+                    "ACTIVATE",
+                    extracted,
+                    rateSets,
+                    rejected,
+                    $"Productos publicados y activados individualmente; total={FormatDuration(totalTimer.Elapsed)}.",
+                    100
+                )
+            );
+        }
+        if (productIssues.Count > 0)
+        {
+            progress?.Report(
+                new MigrationProgress(
+                    "PRODUCT_ISSUE_SUMMARY",
+                    extracted,
+                    rateSets,
+                    rejected,
+                    "Conflictos resueltos al conservar el mayor idTasa en los productos: "
+                        + string.Join(", ", productIssues.Select(issue => issue.ProductId)) + ".",
+                    100
+                )
+            );
+        }
 
         return new MigrationSummary(
             "DIRECT",
             extracted,
             extracted,
-            0,
+            rejected,
             rateSets,
-            snapshots.Select(snapshot => snapshot.VersionId).ToArray()
-        );
+            versionIds
+        )
+        {
+            ProductIssues = productIssues,
+        };
     }
 
     private async Task<List<BsonDocument>> ReadAllRowsAsync(
@@ -582,23 +679,46 @@ public sealed class ConfiguredPricingMigrationService
         var snapshotTimer = Stopwatch.StartNew();
 
         var rateSets = new List<BsonDocument>();
+        var conflicts = new List<MigrationRateConflict>();
         foreach (var sameCell in rows.GroupBy(row => row["applicabilityKey"].AsString, StringComparer.Ordinal))
         {
             var rates = new BsonArray();
             foreach (var sameRateType in sameCell.GroupBy(row => row["rateTypeId"].ToInt32()))
             {
                 var first = sameRateType.First();
-                if (sameRateType.Skip(1).Any(row => !RatesEquivalent(first["rate"].AsBsonDocument, row["rate"].AsBsonDocument)))
-                    throw new InvalidOperationException(
-                        $"La celda {sameCell.Key} tiene tasas incompatibles para el tipo {sameRateType.Key}."
+                var hasIncompatibleRates = sameRateType.Skip(1).Any(row =>
+                    !RatesEquivalent(first["rate"].AsBsonDocument, row["rate"].AsBsonDocument)
+                );
+                var selected = hasIncompatibleRates
+                    ? sameRateType.MaxBy(row => row["legacyRateId"].ToInt64())!
+                    : first;
+                if (hasIncompatibleRates)
+                {
+                    conflicts.Add(
+                        new MigrationRateConflict(
+                            sameCell.Key,
+                            sameRateType.Key,
+                            selected["legacyRateId"].ToInt64(),
+                            sameRateType.Select(ToMigrationRateValue)
+                                .OrderBy(rate => rate.LegacyRateId)
+                                .ToArray()
+                        )
                     );
+                }
                 rates.Add(new BsonDocument
                 {
                     { "rateTypeId", sameRateType.Key },
-                    { "compensatory", first["rate"].AsBsonDocument["compensatory"] },
-                    { "compensatoryMax", first["rate"].AsBsonDocument["compensatoryMax"] },
-                    { "moratory", first["rate"].AsBsonDocument["moratory"] },
-                    { "legacyRateIds", new BsonArray(sameRateType.Select(row => row["legacyRateId"]).OrderBy(id => id.ToInt64())) },
+                    { "compensatory", selected["rate"].AsBsonDocument["compensatory"] },
+                    { "compensatoryMax", selected["rate"].AsBsonDocument["compensatoryMax"] },
+                    { "moratory", selected["rate"].AsBsonDocument["moratory"] },
+                    {
+                        "legacyRateIds",
+                        hasIncompatibleRates
+                            ? new BsonArray { selected["legacyRateId"] }
+                            : new BsonArray(
+                                sameRateType.Select(row => row["legacyRateId"]).OrderBy(id => id.ToInt64())
+                            )
+                    },
                 });
             }
             var representative = sameCell.First();
@@ -613,7 +733,6 @@ public sealed class ConfiguredPricingMigrationService
                 { "active", true },
             });
         }
-
         var snapshotHash = Hash(string.Join(
             "\n",
             rateSets.OrderBy(rateSet => rateSet["applicabilityKey"].AsString, StringComparer.Ordinal)
@@ -634,6 +753,7 @@ public sealed class ConfiguredPricingMigrationService
             snapshotHash,
             rows,
             rateSets,
+            conflicts,
             branchGroupCount,
             internalRatingGroupCount,
             inferenceTimer.Elapsed,
@@ -949,6 +1069,7 @@ public sealed class ConfiguredPricingMigrationService
         string SnapshotHash,
         IReadOnlyList<BsonDocument> Rows,
         IReadOnlyList<BsonDocument> RateSets,
+        IReadOnlyList<MigrationRateConflict> Conflicts,
         int BranchGroupCount,
         int InternalRatingGroupCount,
         TimeSpan InferenceDuration,
@@ -967,6 +1088,22 @@ public sealed class ConfiguredPricingMigrationService
             TimeSpan.Zero
         );
     }
+
+    private static MigrationRateValue ToMigrationRateValue(BsonDocument row)
+    {
+        var rate = row["rate"].AsBsonDocument;
+        return new MigrationRateValue(
+            row["legacyRateId"].ToInt64(),
+            PreviewDecimal(rate["compensatory"]),
+            PreviewDecimal(rate["compensatoryMax"]),
+            PreviewDecimal(rate["moratory"])
+        );
+    }
+
+    private static string FormatResolvedProductIssue(MigrationProductIssue issue) =>
+        $"Producto {issue.ProductId}: {issue.Conflicts.Count} conflicto(s) resuelto(s); "
+            + $"se conservaron los mayores idTasa y se omitieron {issue.DiscardedRateRows} fila(s)."
+            + " El detalle se guardara al finalizar la migracion.";
 
     private static string FormatDuration(TimeSpan duration) => duration.TotalMinutes >= 1
         ? $"{duration.TotalMinutes:N1} min"

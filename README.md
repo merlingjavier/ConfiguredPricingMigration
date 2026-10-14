@@ -1,6 +1,6 @@
 # Configured Pricing Migration
 
-Aplicacion WinForms independiente para sincronizar `dbo.SI_FinTasa` con la base operativa. Cada ejecución genera una versión inmutable a partir del estado actual de SQL Server y la activa solo al finalizar correctamente. No usa base MongoDB de staging ni requiere `Run ID`.
+Aplicacion WinForms independiente para sincronizar `dbo.SI_FinTasa` con la base operativa. Cada ejecución genera versiones inmutables a partir del estado actual de SQL Server. Ordinario publica y activa cada producto al terminarlo; Línea Base y Especial se activan solo al finalizar correctamente su esquema global. No usa base MongoDB de staging ni requiere `Run ID`.
 
 Las conexiones y bases de datos se configuran exclusivamente mediante variables
 de entorno o el archivo `.env`; no se muestran ni se editan desde la interfaz.
@@ -33,7 +33,7 @@ migración.
 
 Para Ordinario, si `idProductos` esta vacio, se resuelven productos vigentes del modulo 1 con tasas de credito elegibles antes de iniciar la migracion. Los IDs ingresados manualmente se validan con los mismos criterios. Línea Base y Especial no consultan `SI_FinProducto` para descubrir filas: recorren `SI_FinTasa` por `idTasa`, con tipos de tasa vigentes del módulo 1 y, en Especial, monto y establecimiento vigentes. `idProducto` solo se conserva como trazabilidad cuando está informado.
 
-Durante la carga, el boton `Ejecutar migración` sincroniza primero los catalogos vigentes del modulo de creditos hacia la base operativa y registra el snapshot en el Run ID. Si falla esa sincronizacion, el ETL no inicia. `Detener migración` en Ordinario conserva los productos terminados y crea un Run para los pendientes. Línea Base y Especial deben publicarse como una unidad global; al detenerlos se cierra el Run sin publicar y se crea un sucesor para reextraer el esquema completo.
+Durante la carga, el boton `Ejecutar migración` sincroniza primero los catalogos vigentes del modulo de creditos hacia la base operativa. Si falla esa sincronizacion, el ETL no inicia. En Ordinario, cada producto se escribe, publica y activa antes de continuar con el siguiente, por lo que los productos terminados se conservan si falla o se detiene una ejecución posterior. Línea Base y Especial deben publicarse como una unidad global; se activan únicamente después de persistir por completo el esquema global.
 
 ## Sincronizacion y publicacion
 
