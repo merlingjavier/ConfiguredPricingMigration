@@ -40,6 +40,10 @@ public sealed class ConfiguredPricingMigrationService
             throw new ArgumentOutOfRangeException(nameof(options.BatchSize));
         }
 
+        if (options.SqlCommandTimeoutSeconds <= 0)
+            throw new ArgumentOutOfRangeException(nameof(options.SqlCommandTimeoutSeconds),
+                "El tiempo de espera SQL debe ser mayor que cero.");
+
         if (options.ProductIds.Any(id => id <= 0))
         {
             throw new ArgumentOutOfRangeException(nameof(options.ProductIds));
@@ -438,6 +442,10 @@ public sealed class ConfiguredPricingMigrationService
     )
     {
         var totalTimer = Stopwatch.StartNew();
+        var target = TargetDatabase();
+        progress?.Report(new MigrationProgress("INDEXES", 0, 0, 0, "Verificando indices de la base destino."));
+        await EnsureTargetIndexesAsync(target, cancellationToken);
+
         progress?.Report(new MigrationProgress("CATALOG_SYNC", 0, 0, 0, "Sincronizando catalogos."));
         var catalogTimer = Stopwatch.StartNew();
         var catalogSync = new CatalogSyncService(
@@ -475,13 +483,12 @@ public sealed class ConfiguredPricingMigrationService
         long extracted = 0;
         long rejected = 0;
         long rateSets = 0;
-        var target = TargetDatabase();
         for (var scopeIndex = 0; scopeIndex < scopes.Length; scopeIndex++)
         {
             var productId = scopes[scopeIndex];
             var scopeLabel = productId?.ToString() ?? _options.TypeSchema;
             var extractionTimer = Stopwatch.StartNew();
-            var rows = await ReadAllRowsAsync(productId, cancellationToken);
+            var rows = await ReadAllRowsAsync(productId, progress, cancellationToken);
             if (rows.Count == 0)
                 continue;
 
@@ -646,6 +653,7 @@ public sealed class ConfiguredPricingMigrationService
 
     private async Task<List<BsonDocument>> ReadAllRowsAsync(
         int? productId,
+        IProgress<MigrationProgress>? progress,
         CancellationToken cancellationToken
     )
     {
@@ -653,18 +661,45 @@ public sealed class ConfiguredPricingMigrationService
         long lastRateId = 0;
         while (true)
         {
-            var batch = await ReadBatchAsync(
-                "direct",
-                productId,
-                lastRateId,
-                _options.BatchSize,
-                _options.TypeSchema,
-                cancellationToken
-            );
+            cancellationToken.ThrowIfCancellationRequested();
+            var description = $"esquema={_options.TypeSchema}; producto={productId?.ToString() ?? "GLOBAL"}; "
+                + $"ultimoIdTasa={lastRateId}; lote={_options.BatchSize}; "
+                + $"timeoutSQL={_options.SqlCommandTimeoutSeconds}s";
+            progress?.Report(new MigrationProgress("SQL_BATCH_START", rows.Count, 0, 0, description));
+            var timer = Stopwatch.StartNew();
+            List<BsonDocument> batch;
+            try
+            {
+                batch = await ReadBatchAsync(
+                    "direct",
+                    productId,
+                    lastRateId,
+                    _options.BatchSize,
+                    _options.TypeSchema,
+                    cancellationToken
+                );
+            }
+            catch (Exception exception)
+            {
+                var stage = cancellationToken.IsCancellationRequested
+                    ? "SQL_BATCH_CANCELLED"
+                    : exception is SqlException { Number: -2 } ? "SQL_BATCH_TIMEOUT" : "SQL_BATCH_ERROR";
+                var error = exception is SqlException sqlException
+                    ? $"codigoSQL={sqlException.Number}"
+                    : $"tipoError={exception.GetType().Name}";
+                progress?.Report(new MigrationProgress(stage, rows.Count, 0, 0,
+                    $"{description}; duracion={FormatDuration(timer.Elapsed)}; {error}."));
+                throw;
+            }
+
+            var lastReadId = batch.Count == 0 ? lastRateId : batch[^1]["legacyRateId"].ToInt64();
+            progress?.Report(new MigrationProgress("SQL_BATCH_END", rows.Count + batch.Count, 0, 0,
+                $"{description}; filas={batch.Count}; ultimoIdTasaLeido={lastReadId}; "
+                + $"duracion={FormatDuration(timer.Elapsed)}."));
             if (batch.Count == 0)
                 return rows;
             rows.AddRange(batch);
-            lastRateId = batch[^1]["legacyRateId"].ToInt64();
+            lastRateId = lastReadId;
         }
     }
 
@@ -675,11 +710,96 @@ public sealed class ConfiguredPricingMigrationService
     {
         var schemaId = rows[0]["configuredPricingId"].AsString;
         var inferenceTimer = Stopwatch.StartNew();
-        await InferDirectDimensionGroupsAsync(rows, cancellationToken);
+        var normalized = _options.TypeSchema == Ordinary
+            ? NormalizeOrdinaryRateRows(rows, cancellationToken)
+            : new NormalizedRateRows(rows, []);
+        await InferDirectDimensionGroupsAsync(normalized.Rows, cancellationToken);
         var snapshotTimer = Stopwatch.StartNew();
 
-        var rateSets = new List<BsonDocument>();
+        var conflicts = normalized.Conflicts.ToList();
+        var rateSets = BuildDirectRateSets(schemaId, _options.TypeSchema, normalized.Rows, conflicts);
+        var snapshotHash = Hash(string.Join(
+            "\n",
+            rateSets.OrderBy(rateSet => rateSet["applicabilityKey"].AsString, StringComparer.Ordinal)
+                .Select(rateSet => rateSet.ToJson())
+        ));
+        var versionId = $"configured-pricing-version:{Hash($"{schemaId}|{snapshotHash}")}";
+        foreach (var rateSet in rateSets)
+        {
+            rateSet["_id"] = $"configured-pricing-rate-set:{Hash($"{versionId}|{rateSet["applicabilityKey"]}")}";
+            rateSet["configuredPricingVersionId"] = versionId;
+            rateSet["contentHash"] = Hash(rateSet.ToJson());
+        }
+        var branchGroupCount = CountDirectGroups(normalized.Rows, "branch");
+        var internalRatingGroupCount = CountDirectGroups(normalized.Rows, "internalRating");
+        return new DirectSnapshot(
+            schemaId,
+            versionId,
+            snapshotHash,
+            rows,
+            rateSets,
+            conflicts,
+            branchGroupCount,
+            internalRatingGroupCount,
+            inferenceTimer.Elapsed,
+            snapshotTimer.Elapsed
+        );
+    }
+
+    private static NormalizedRateRows NormalizeOrdinaryRateRows(
+        IReadOnlyList<BsonDocument> rows,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var effectiveRows = new List<BsonDocument>(rows.Count);
         var conflicts = new List<MigrationRateConflict>();
+        var originalContexts = rows.GroupBy(row => (
+                SchemaId: row["configuredPricingId"].AsString,
+                ApplicabilityKey: row["applicabilityKey"].AsString,
+                RateTypeId: row["rateTypeId"].ToInt32()))
+            .OrderBy(group => group.Key.SchemaId, StringComparer.Ordinal)
+            .ThenBy(group => group.Key.ApplicabilityKey, StringComparer.Ordinal)
+            .ThenBy(group => group.Key.RateTypeId);
+
+        foreach (var context in originalContexts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var first = context.First();
+            var hasConflict = context.Skip(1).Any(row =>
+                !RatesEquivalent(first["rate"].AsBsonDocument, row["rate"].AsBsonDocument));
+            var selected = hasConflict
+                ? context.MaxBy(row => row["legacyRateId"].ToInt64())!
+                : context.MinBy(row => row["legacyRateId"].ToInt64())!;
+            if (hasConflict)
+            {
+                conflicts.Add(new MigrationRateConflict(
+                    context.Key.ApplicabilityKey,
+                    context.Key.RateTypeId,
+                    selected["legacyRateId"].ToInt64(),
+                    context.Select(ToMigrationRateValue).OrderBy(rate => rate.LegacyRateId).ToArray()));
+            }
+
+            var effective = selected.DeepClone().AsBsonDocument;
+            effective["consolidatedLegacyRateIds"] = hasConflict
+                ? new BsonArray { selected["legacyRateId"] }
+                : new BsonArray(context.SelectMany(LegacyRateIds).Distinct().Order());
+            effectiveRows.Add(effective);
+        }
+
+        return new NormalizedRateRows(effectiveRows, conflicts);
+    }
+
+    private sealed record NormalizedRateRows(
+        IReadOnlyList<BsonDocument> Rows,
+        IReadOnlyList<MigrationRateConflict> Conflicts);
+
+    private static List<BsonDocument> BuildDirectRateSets(
+        string schemaId,
+        string typeSchema,
+        IReadOnlyList<BsonDocument> rows,
+        List<MigrationRateConflict> conflicts)
+    {
+        var rateSets = new List<BsonDocument>();
         foreach (var sameCell in rows.GroupBy(row => row["applicabilityKey"].AsString, StringComparer.Ordinal))
         {
             var rates = new BsonArray();
@@ -716,7 +836,7 @@ public sealed class ConfiguredPricingMigrationService
                         hasIncompatibleRates
                             ? new BsonArray { selected["legacyRateId"] }
                             : new BsonArray(
-                                sameRateType.Select(row => row["legacyRateId"]).OrderBy(id => id.ToInt64())
+                                sameRateType.SelectMany(LegacyRateIds).Distinct().Order()
                             )
                     },
                 });
@@ -725,7 +845,7 @@ public sealed class ConfiguredPricingMigrationService
             rateSets.Add(new BsonDocument
             {
                 { "configuredPricingId", schemaId },
-                { "typeSchema", _options.TypeSchema },
+                { "typeSchema", typeSchema },
                 { "pricingMode", representative["pricingMode"] },
                 { "applicabilityKey", sameCell.Key },
                 { "coordinates", DirectCoordinates(representative) },
@@ -733,32 +853,7 @@ public sealed class ConfiguredPricingMigrationService
                 { "active", true },
             });
         }
-        var snapshotHash = Hash(string.Join(
-            "\n",
-            rateSets.OrderBy(rateSet => rateSet["applicabilityKey"].AsString, StringComparer.Ordinal)
-                .Select(rateSet => rateSet.ToJson())
-        ));
-        var versionId = $"configured-pricing-version:{Hash($"{schemaId}|{snapshotHash}")}";
-        foreach (var rateSet in rateSets)
-        {
-            rateSet["_id"] = $"configured-pricing-rate-set:{Hash($"{versionId}|{rateSet["applicabilityKey"]}")}";
-            rateSet["configuredPricingVersionId"] = versionId;
-            rateSet["contentHash"] = Hash(rateSet.ToJson());
-        }
-        var branchGroupCount = CountDirectGroups(rows, "branch");
-        var internalRatingGroupCount = CountDirectGroups(rows, "internalRating");
-        return new DirectSnapshot(
-            schemaId,
-            versionId,
-            snapshotHash,
-            rows,
-            rateSets,
-            conflicts,
-            branchGroupCount,
-            internalRatingGroupCount,
-            inferenceTimer.Elapsed,
-            snapshotTimer.Elapsed
-        );
+        return rateSets;
     }
 
     private static int CountDirectGroups(IReadOnlyList<BsonDocument> rows, string dimension) => rows
@@ -782,19 +877,40 @@ public sealed class ConfiguredPricingMigrationService
         if (dimensions.Length == 0)
             return;
 
-        foreach (var dimension in dimensions)
-            AssignSingletonGroups(rows, dimension);
-
-        var changed = true;
-        while (changed)
+        if (_options.TypeSchema == Ordinary)
         {
-            changed = false;
+            InferOrdinaryDimensionPartitions(rows, cancellationToken);
+        }
+        else
+        {
             foreach (var dimension in dimensions)
-                changed |= InferDirectDimensionPartition(rows, dimension);
+                AssignSingletonGroups(rows, dimension);
+            foreach (var dimension in dimensions)
+                InferDirectDimensionPartition(rows, dimension);
         }
 
         foreach (var dimension in dimensions)
             await PersistDirectDimensionGroupsAsync(rows, dimension, cancellationToken);
+    }
+
+    private static void InferOrdinaryDimensionPartitions(
+        IReadOnlyList<BsonDocument> rows,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        AssignSingletonGroups(rows, "branch");
+        AssignSingletonGroups(rows, "internalRating");
+
+        // Establishments must first match for every original classification. Contextual
+        // profile groups must never influence this comparison or broaden their coverage.
+        InferDirectDimensionPartition(rows, "branch");
+        var branchContexts = rows.GroupBy(row => row["dimensionGroupIds"]["branch"].AsString)
+            .OrderBy(group => group.Key, StringComparer.Ordinal);
+        foreach (var context in branchContexts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            InferDirectDimensionPartition(context.ToArray(), "internalRating");
+        }
     }
 
     private static void AssignSingletonGroups(IReadOnlyList<BsonDocument> rows, string dimension)
@@ -2208,7 +2324,10 @@ ORDER BY t.idTasa;
         var result = new List<BsonDocument>();
         await using var connection = new SqlConnection(_options.SqlConnectionString);
         await connection.OpenAsync(cancellationToken);
-        await using var command = new SqlCommand(sql, connection);
+        await using var command = new SqlCommand(sql, connection)
+        {
+            CommandTimeout = _options.SqlCommandTimeoutSeconds
+        };
         command.Parameters.AddWithValue("@batchSize", batchSize);
         if (productId is not null)
             command.Parameters.AddWithValue("@productId", productId.Value);
@@ -2580,18 +2699,23 @@ ORDER BY t.idTasa;
     private static string? GlobalRateSignature(IEnumerable<BsonDocument> rows, string dimensionKey)
     {
         var entries = rows.GroupBy(row => RateContextKey(row, dimensionKey), StringComparer.Ordinal)
-            .OrderBy(group => group.Key)
-            .ToList();
-        if (entries.Any(group => group.Count() != 1))
-            return null;
-        return string.Join(
-            "|",
-            entries.Select(group =>
-            {
-                var rate = group.Single()["rate"].AsBsonDocument;
-                return $"{group.Key}:{rate["compensatory"]}:{rate["compensatoryMax"]}:{rate["moratory"]}";
-            })
-        );
+            .OrderBy(group => group.Key, StringComparer.Ordinal);
+        var signatures = new List<string>();
+        foreach (var context in entries)
+        {
+            var rate = context.First()["rate"].AsBsonDocument;
+            if (context.Skip(1).Any(row => !RatesEquivalent(rate, row["rate"].AsBsonDocument)))
+                return null;
+
+            signatures.Add(
+                $"{context.Key}:"
+                + $"{RangeBoundKey(rate.GetValue("compensatory", BsonNull.Value))}:"
+                + $"{RangeBoundKey(rate.GetValue("compensatoryMax", BsonNull.Value))}:"
+                + $"{RangeBoundKey(rate.GetValue("moratory", BsonNull.Value))}"
+            );
+        }
+
+        return string.Join("|", signatures);
     }
 
     private static string RateContextKey(BsonDocument row, string dimensionKey)

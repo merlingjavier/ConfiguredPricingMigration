@@ -2,6 +2,9 @@ namespace ConfiguredPricingMigration.Core;
 
 public sealed class MigrationOptions
 {
+    /// <summary>Default SQL extraction command timeout, in seconds.</summary>
+    public const int DefaultSqlCommandTimeoutSeconds = 180;
+
     public string SqlConnectionString { get; init; } = string.Empty;
     [Obsolete("La sincronizacion directa no usa una base de migracion.")]
     public string MigrationMongoConnectionString { get; init; } = string.Empty;
@@ -11,7 +14,25 @@ public sealed class MigrationOptions
     public string TargetMongoDatabase { get; init; } = "ConfiguredPricing";
     public string TypeSchema { get; init; } = "ORDINARY";
     public int BatchSize { get; init; } = 10_000;
+    /// <summary>SQL timeout per extraction batch; must be greater than zero.</summary>
+    public int SqlCommandTimeoutSeconds { get; init; } = DefaultSqlCommandTimeoutSeconds;
     public IReadOnlyList<int> ProductIds { get; init; } = Array.Empty<int>();
+
+    /// <summary>Parses the optional SQL extraction timeout configuration.</summary>
+    /// <param name="value">Value of MIGRATION_SQL_COMMAND_TIMEOUT_SECONDS, or null.</param>
+    /// <returns>The configured positive timeout, or the default if no value was supplied.</returns>
+    /// <exception cref="ArgumentException">The configured value is not a positive integer.</exception>
+    public static int ParseSqlCommandTimeoutSeconds(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return DefaultSqlCommandTimeoutSeconds;
+
+        if (!int.TryParse(value, out var seconds) || seconds <= 0)
+            throw new ArgumentException(
+                "MIGRATION_SQL_COMMAND_TIMEOUT_SECONDS debe ser un entero mayor que cero.", nameof(value));
+
+        return seconds;
+    }
 }
 
 public sealed record MigrationProgress(

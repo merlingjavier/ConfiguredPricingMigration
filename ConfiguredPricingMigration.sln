@@ -6,6 +6,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ConfiguredPricingMigration.
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ConfiguredPricingMigration.UI", "ConfiguredPricingMigration.UI\ConfiguredPricingMigration.UI.csproj", "{D53ACF9D-24B8-4A2D-A36B-8FC87A504D8C}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ConfiguredPricingMigration.Tests", "ConfiguredPricingMigration.Tests\ConfiguredPricingMigration.Tests.csproj", "{952904C2-3725-43DC-B6DA-A719679C24FC}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -20,5 +22,9 @@ Global
 		{D53ACF9D-24B8-4A2D-A36B-8FC87A504D8C}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{D53ACF9D-24B8-4A2D-A36B-8FC87A504D8C}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{D53ACF9D-24B8-4A2D-A36B-8FC87A504D8C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{952904C2-3725-43DC-B6DA-A719679C24FC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{952904C2-3725-43DC-B6DA-A719679C24FC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{952904C2-3725-43DC-B6DA-A719679C24FC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{952904C2-3725-43DC-B6DA-A719679C24FC}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

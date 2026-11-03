@@ -729,6 +729,8 @@ public sealed class MainForm : Form
         TargetMongoConnectionString = _targetMongoConnection.Text.Trim(),
         TargetMongoDatabase = _targetMongoDatabase.Text.Trim(),
         BatchSize = Decimal.ToInt32(_batchSize.Value),
+        SqlCommandTimeoutSeconds = MigrationOptions.ParseSqlCommandTimeoutSeconds(
+            GetEnvironmentValue("MIGRATION_SQL_COMMAND_TIMEOUT_SECONDS")),
         ProductIds = _ordinarySchema.Checked
             ? ParseProductIds(_productIds.Text)
             : Array.Empty<int>(),

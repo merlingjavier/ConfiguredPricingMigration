@@ -17,6 +17,7 @@ TARGET_MONGO_CONNECTION_STRING="mongodb://..."
 TARGET_MONGO_DATABASE="ConfiguredPricing"
 MIGRATION_BATCH_SIZE=10000
 MIGRATION_PRODUCT_IDS=1028,1035,1041
+MIGRATION_SQL_COMMAND_TIMEOUT_SECONDS=180
 ```
 
 | Configuracion | Variable de entorno | Uso |
@@ -26,6 +27,15 @@ MIGRATION_PRODUCT_IDS=1028,1035,1041
 | Base operativa | `TARGET_MONGO_DATABASE` | Nombre de la base MongoDB/DocumentDB operativa. El valor predeterminado es `ConfiguredPricing`. |
 | idProductos separados por coma | `MIGRATION_PRODUCT_IDS` | Filtro disponible solo para Ordinario. Línea Base y Especial leen los registros elegibles de `SI_FinTasa` sin filtrar ni exigir `idProducto`. |
 | Tamano de lote | `MIGRATION_BATCH_SIZE` | Filas leidas y confirmadas por iteracion. Acepta valores entre 1,000 y 100,000; el predeterminado es 10,000. |
+| Timeout SQL de extraccion | `MIGRATION_SQL_COMMAND_TIMEOUT_SECONDS` | Tiempo de espera del comando SQL de cada lote, en segundos. El predeterminado es 180; debe ser un entero positivo. No admite cero ni timeout infinito. |
+
+La extraccion registra `SQL_BATCH_START` y `SQL_BATCH_END` por lote, incluyendo esquema,
+producto (o `GLOBAL`), ultimo `idTasa` de partida, tamano de lote, timeout configurado,
+filas leidas, ultimo `idTasa` obtenido y duracion. Un error SQL `-2` se registra como
+`SQL_BATCH_TIMEOUT`; otros errores y cancelaciones se identifican como `SQL_BATCH_ERROR`
+y `SQL_BATCH_CANCELLED`. La excepcion original se conserva para los detalles tecnicos.
+No se registran cadenas de conexion, credenciales ni el cuerpo de la consulta.
+El timeout de comando no cambia el timeout de conexion ni desactiva la cancelacion del usuario.
 
 La vista previa de matrices está temporalmente oculta en la interfaz. La carga,
 validación y publicación de Runs continúan disponibles desde la pantalla de
@@ -33,11 +43,17 @@ migración.
 
 Para Ordinario, si `idProductos` esta vacio, se resuelven productos vigentes del modulo 1 con tasas de credito elegibles antes de iniciar la migracion. Los IDs ingresados manualmente se validan con los mismos criterios. Línea Base y Especial no consultan `SI_FinProducto` para descubrir filas: recorren `SI_FinTasa` por `idTasa`, con tipos de tasa vigentes del módulo 1 y, en Especial, monto y establecimiento vigentes. `idProducto` solo se conserva como trazabilidad cuando está informado.
 
-Durante la carga, el boton `Ejecutar migración` sincroniza primero los catalogos vigentes del modulo de creditos hacia la base operativa. Si falla esa sincronizacion, el ETL no inicia. En Ordinario, cada producto se escribe, publica y activa antes de continuar con el siguiente, por lo que los productos terminados se conservan si falla o se detiene una ejecución posterior. Línea Base y Especial deben publicarse como una unidad global; se activan únicamente después de persistir por completo el esquema global.
+Durante la carga, el boton `Ejecutar migración` prepara primero los indices de la base operativa y luego sincroniza los catalogos vigentes del modulo de creditos. Si falla cualquiera de esos pasos, el ETL no inicia. En Ordinario, cada producto se escribe, publica y activa antes de continuar con el siguiente, por lo que los productos terminados se conservan si falla o se detiene una ejecución posterior. Línea Base y Especial deben publicarse como una unidad global; se activan únicamente después de persistir por completo el esquema global.
 
 ## Sincronizacion y publicacion
 
 La sincronización es idempotente. Las celdas tienen IDs deterministas y cada versión se identifica por el hash del snapshot de SQL Server. Si el origen no cambió, se reutiliza la misma versión; si cambió, se crea una nueva versión que contiene exclusivamente las celdas presentes en SQL. Las versiones previas se conservan como historial.
+
+La preparacion inicial crea o verifica en `ConfiguredPricingRates` el indice compuesto unico
+`configuredPricingVersionId`, `configuredPricingId`, `applicabilityKey`, en ese orden.
+Su prefijo permite consultar las celdas de una version sin recorrer toda la coleccion.
+Los indices existentes compatibles se conservan; una definicion incompatible o datos que
+incumplan la unicidad detienen la ejecucion. No se eliminan ni reconstruyen indices automaticamente.
 
 `Transferir y publicar Run validado` no usa un endpoint HTTP. Copia desde la base de migracion solo los esquemas, versiones, rangos, grupos genericos y celdas del `Run ID` seleccionado hacia la base operativa. Antes de transferir exige una validacion correcta y ausencia de celdas ambiguas. La transferencia se puede reintentar: los documentos destino se reemplazan por su misma clave y no se copian colecciones de staging.
 
@@ -59,12 +75,51 @@ Una celda solo puede tener una tasa por `idTipoTasa` para la misma clave de esqu
 
 La migracion inicial crea grupos `AUTO-*` con IDs canonicos derivados de sus miembros. `DEFAULT` es solo una etiqueta informativa cuando el grupo contiene todos los miembros vigentes de una dimension; no altera su identidad. La consolidacion conserva la trazabilidad de los IDs legacy.
 
+En Ordinario, antes de inferir grupos se normalizan las filas por esquema, coordenadas
+originales y tipo de tasa. Si sus valores de compensatoria, maxima o moratoria difieren,
+se conserva la fila con el mayor `idTasa`, manteniendo la regla vigente. El reporte de
+conflictos conserva todos los IDs y valores originales, incluido el ganador; solo el ID
+seleccionado pasa a la trazabilidad operativa de ese contexto conflictivo. Si los valores
+coinciden, se conservan todos los IDs equivalentes.
+
+Los grupos de establecimientos y clasificaciones se comparan sobre esas tasas efectivas,
+no sobre el historial descartado. Deben coincidir todos los contextos de monto, plazo,
+seguro, moneda, tipo de persona, modalidad y tipo de tasa. Las diferencias efectivas
+impiden la equivalencia. Al construir las celdas se unen los IDs retenidos de los grupos
+equivalentes. Las filas originales permanecen disponibles para el conteo de extraccion
+y la trazabilidad de rangos; la normalizacion no las modifica. Este ajuste no cambia el
+flujo de Linea Base ni Especial.
+
+### Clasificaciones por establecimiento (Ordinario)
+
+La inferencia agrupa primero establecimientos con matrices completas iguales para cada
+clasificacion original. Dentro de cada grupo de establecimientos agrupa las clasificaciones
+que coinciden en toda su matriz: cobertura de rangos, seguro, moneda, persona, modalidad,
+tipos de tasa y valores de compensatoria, maxima y moratoria. Una clasificacion puede
+pertenecer a `1,2,3` en un establecimiento y permanecer separada en otro. No se agrupa
+solo por la tasa visible ni por una celda aislada. Los IDs de grupo siguen derivados de
+sus miembros; las celdas determinan en que establecimientos se utiliza cada grupo.
+
+La normalizacion de conflictos se mantiene antes de esta inferencia y los IDs legacy
+retenidos se unen al consolidar. No se amplian combinaciones ni se rellenan tasas ausentes.
+La consulta de mantenimiento sigue devolviendo la matriz completa, sin contextualizar
+la descarga. S y CoreBank deben actualizarse junto con la migracion: la configuracion de
+grupos `PROFILE` requiere `BranchGroup.Identification` y solo reemplaza las celdas de ese
+grupo de establecimientos. Establecimientos y clasificaciones se configuran en solicitudes
+separadas; CoreBank muestra las clasificaciones disponibles en el establecimiento seleccionado.
+
 ## Compilacion y distribucion
 
 Para compilar la aplicacion durante el desarrollo:
 
 ```powershell
 dotnet build .\ConfiguredPricingMigration.UI\ConfiguredPricingMigration.UI.csproj -c Release
+```
+
+Las pruebas de consolidacion e indices usan datos sinteticos y mocks, sin conexiones a SQL Server ni MongoDB:
+
+```powershell
+dotnet test .\ConfiguredPricingMigration.Tests\ConfiguredPricingMigration.Tests.csproj -c Release
 ```
 
 Para generar un ejecutable autocontenido para Windows de 64 bits, sin requerir
